@@ -1,0 +1,128 @@
+# ~/.nix-aliases.sh  — nix command aliases & helpers
+# Default flake (override with: export NIX_FLAKE="github:NixOS/nixpkgs/<rev>")
+: "${NIX_FLAKE:=nixpkgs}"
+
+# ---- Search / install / remove / list / upgrade --------------------------------
+ns() { nix search "$NIX_FLAKE" "$@"; }                                   # search
+ni() { for p in "$@"; do nix profile install "$NIX_FLAKE#$p"; done; }    # install
+nrm() {
+  for t in "$@"; do
+    # numeric -> index
+    if [[ "$t" =~ ^[0-9]+$ ]]; then nix profile remove "$t" && continue; fi
+    # try as flake spec and as plain name (don’t rely on exit code)
+    nix profile remove "$NIX_FLAKE#$t" >/dev/null 2>&1
+    nix profile remove "$t"            >/dev/null 2>&1
+    # last resort: regex match (substring)
+    nix profile remove --regex "$t"    >/dev/null 2>&1
+  done
+}
+nls() { nix profile list; }                                              # list profile
+nup() { nix profile upgrade --all; }                                     # upgrade all
+
+# ---- Run / Shell / Develop / Build --------------------------------------------
+nr()  { nix run   "$NIX_FLAKE#${1:?pkg}" -- "${@:2}"; }                  # run app
+nsh() {                                                                  # ad-hoc shell
+  local pkgs=(); for p in "$@"; do pkgs+=("$NIX_FLAKE#$p"); done; nix shell "${pkgs[@]}";
+}
+ndev() { nix develop "${1:-.}"; }                                        # dev shell (flake)
+nb()  { nix build "$NIX_FLAKE#${1:?pkg}" --print-out-paths; }            # build pkg
+nbi() { nix build "$@" --print-out-paths; }                              # generic build
+
+# ---- Inspect / metadata --------------------------------------------------------
+nver()  { nix eval --raw "$NIX_FLAKE#${1:?pkg}.version"; }               # version
+nmeta() { nix eval        "$NIX_FLAKE#${1:?pkg}.meta"; }                 # metadata
+npi()   { nix path-info -rsSh "$NIX_FLAKE#${1:?pkg}"; }                  # closure size, etc.
+ndrv()  {                                                                # derivation JSON
+  if command -v jq >/dev/null; then nix derivation show "$NIX_FLAKE#${1:?pkg}" | jq;
+  else nix derivation show "$NIX_FLAKE#${1:?pkg}"; fi
+}
+nedit() { nix edit "$NIX_FLAKE#${1:?pkg}"; }                             # open package expr
+
+# ---- Store / GC / Optimisation -------------------------------------------------
+ngc()   { nix-collect-garbage; }                                         # GC unreachable paths
+ngcd()  { nix-collect-garbage -d; }                                      # drop old gens + GC
+nroots(){ nix-store --gc --print-roots; }                                # list GC roots
+nopt()  { nix store optimise; }                                          # dedupe store (hardlink)
+
+# ---- Flakes --------------------------------------------------------------------
+nfs() { nix flake show      "${1:-$NIX_FLAKE}"; }                        # show outputs
+nfm() { nix flake metadata  "${1:-$NIX_FLAKE}"; }                        # flake info
+nfup(){ nix flake update    "${1:-.}"; }                                 # update inputs
+
+# ---- Pinning helpers -----------------------------------------------------------
+nset()        { export NIX_FLAKE="${1:?flake ref, e.g. github:NixOS/nixpkgs/<rev>}"; nfm "$NIX_FLAKE"; }
+nset-stable(){ nset "nixpkgs/nixos-24.05"; }                             # example pin
+
+# ----- Help: show what each alias/function does -------------------------------
+nix_help() {
+  local f="${NIX_FLAKE:-nixpkgs}"
+  printf "Nix aliases (current NIX_FLAKE=%s)\n\n" "$f"
+  cat <<'EOF'
+Core:
+  ns <query>                 = nix search $NIX_FLAKE <query>
+  ni <pkg...>                = nix profile install $NIX_FLAKE#<pkg> [...]
+  nrm <pkg...|idx...>        = nix profile remove $NIX_FLAKE#<pkg> | <idx>
+  nls                        = nix profile list
+  nup                        = nix profile upgrade --all
+
+Run / Shell / Build / Develop:
+  nr <pkg> [args...]         = nix run $NIX_FLAKE#<pkg> -- [args...]
+  nsh <pkg...>               = nix shell $NIX_FLAKE#<pkg> [...]
+  ndev [flake]               = nix develop <flake|.>
+  nb  <pkg>                  = nix build $NIX_FLAKE#<pkg>  (prints ./result path)
+  nbi <args...>              = nix build <args...>         (generic build passthrough)
+
+Inspect:
+  nver <pkg>                 = nix eval --raw $NIX_FLAKE#<pkg>.version
+  nmeta <pkg>                = nix eval $NIX_FLAKE#<pkg>.meta
+  npi <pkg>                  = nix path-info -rsSh $NIX_FLAKE#<pkg>
+  ndrv <pkg>                 = nix derivation show $NIX_FLAKE#<pkg> | jq (if present)
+  nedit <pkg>                = nix edit $NIX_FLAKE#<pkg>
+
+Store / GC / Optimisation:
+  ngc                        = nix-collect-garbage
+  ngcd                       = nix-collect-garbage -d        (drops old gens, then GC)
+  nroots                     = nix-store --gc --print-roots  (find GC roots)
+  nopt                       = nix store optimise            (dedupe via hardlinks)
+
+Flakes:
+  nfs [flake]                = nix flake show <flake|$NIX_FLAKE>
+  nfm [flake]                = nix flake metadata <flake|$NIX_FLAKE>
+  nfup [flake|.]             = nix flake update <flake|.>
+
+Pinning:
+  nset <ref>                 = export NIX_FLAKE=<ref>; nfm   (e.g. github:NixOS/nixpkgs/<rev>)
+  nset-stable                = nset nixpkgs/nixos-24.05
+
+Examples (orca-slicer):
+  ns orca-slicer
+  ni orca-slicer
+  nver orca-slicer
+  ndrv orca-slicer
+  nrm orca-slicer && ngcd
+EOF
+}
+alias nix-help='nix_help'
+
+# ----- whatprovides (requires nix-index database) ----------------------------
+# Usage:
+#   nprov libz.so.1              # search common library location
+#   nprov lib/libz.so.1          # search an exact path fragment
+#   nprov /bin/ls                # search for binaries by path
+nprov() {
+  local pat="${1:?usage: nprov <filename-or-soname> [extra nix-locate args...]}"
+  shift || true
+  # Prefer common library/binary subpaths; fall back to raw pattern
+  if [[ "$pat" == */* ]]; then
+    nix-locate --minimal -w "$pat" "$@"
+  else
+    nix-locate --minimal -w "lib/$pat" "$@" || nix-locate --minimal -w "$pat" "$@"
+  fi
+}
+
+# Optional: search *all* outputs (not just top-level) on nix-index <0.1.9-like behavior
+nprov-all() {
+  local pat="${1:?usage: nprov-all <filename-or-soname>}"
+  shift || true
+  nix-locate --all --minimal -w "$pat" "$@"
+}
